@@ -1,0 +1,204 @@
+/*
+======================================================================
+BAGIAN 1: KODE UNTUK ARDUINO UNO DENGAN LOGIKA FUZZY
+(Tidak ada perubahan di bagian ini)
+======================================================================
+*/
+
+#include <Fuzzy.h>
+
+// --- Definisi Pin ---
+const int SENSOR_PIN = A0; // Sensor terhubung ke pin Analog 0
+const int LED_PIN = 12;    // LED Merah terhubung ke pin 12
+const int BUZZER_PIN = 11; // Buzzer terhubung ke pin 11
+
+// --- Inisialisasi Objek Fuzzy ---
+Fuzzy* fuzzy = new Fuzzy();
+
+// Variabel untuk menyimpan status bahaya terakhir agar tidak mengirim data terus-menerus
+int lastDangerState = 0; // 0=Aman, 1=Waspada, 2=Bahaya
+
+void setup() {
+  // Mulai komunikasi serial untuk mengirim data ke ESP32
+  Serial.begin(9600); 
+  
+  // Inisialisasi pin output
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  // --- Konfigurasi Logika Fuzzy ---
+
+  // 1. Input Fuzzy: KekuatanSinyal
+  FuzzyInput* kekuatanSinyal = new FuzzyInput(1);
+  
+  // Membuat Himpunan Fuzzy untuk KekuatanSinyal (nilai 0-1023)
+  FuzzySet* rendah = new FuzzySet(0, 200, 200, 400);
+  kekuatanSinyal->addFuzzySet(rendah);
+  
+  FuzzySet* sedang = new FuzzySet(300, 500, 500, 700);
+  kekuatanSinyal->addFuzzySet(sedang);
+  
+  FuzzySet* tinggi = new FuzzySet(600, 800, 800, 1023);
+  kekuatanSinyal->addFuzzySet(tinggi);
+  
+  fuzzy->addFuzzyInput(kekuatanSinyal);
+
+  // 2. Output Fuzzy: TingkatBahaya
+  FuzzyOutput* tingkatBahaya = new FuzzyOutput(1);
+  
+  // Membuat Himpunan Fuzzy untuk TingkatBahaya (nilai 0-100)
+  FuzzySet* aman = new FuzzySet(0, 20, 20, 40);
+  tingkatBahaya->addFuzzySet(aman);
+  
+  FuzzySet* waspada = new FuzzySet(30, 50, 50, 70);
+  tingkatBahaya->addFuzzySet(waspada);
+  
+  FuzzySet* bahaya = new FuzzySet(60, 80, 80, 100);
+  tingkatBahaya->addFuzzySet(bahaya);
+
+  fuzzy->addFuzzyOutput(tingkatBahaya);
+
+  // 3. Membangun Aturan Fuzzy (Rules)
+  // Aturan 1: IF KekuatanSinyal is rendah THEN TingkatBahaya is aman
+  FuzzyRule* rule1 = new FuzzyRule(1, IF, rendah, THEN, aman);
+  fuzzy->addFuzzyRule(rule1);
+
+  // Aturan 2: IF KekuatanSinyal is sedang THEN TingkatBahaya is waspada
+  FuzzyRule* rule2 = new FuzzyRule(2, IF, sedang, THEN, waspada);
+  fuzzy->addFuzzyRule(rule2);
+
+  // Aturan 3: IF KekuatanSinyal is tinggi THEN TingkatBahaya is bahaya
+  FuzzyRule* rule3 = new FuzzyRule(3, IF, tinggi, THEN, bahaya);
+  fuzzy->addFuzzyRule(rule3);
+
+  Serial.println("Arduino dengan Logika Fuzzy Siap.");
+}
+
+void loop() {
+  // Baca nilai analog dari sensor
+  int nilaiSensor = analogRead(SENSOR_PIN);
+  
+  // Masukkan nilai sensor ke sistem fuzzy
+  fuzzy->setInput(1, nilaiSensor);
+  
+  // Lakukan proses fuzzifikasi
+  fuzzy->fuzzify();
+  
+  // Lakukan proses defuzzifikasi untuk mendapatkan output pasti (crisp value)
+  float outputBahaya = fuzzy->defuzzify(1);
+
+  // Tentukan status bahaya saat ini
+  int currentDangerState = 0; // Default: Aman
+  if (outputBahaya >= 30 && outputBahaya < 60) {
+    currentDangerState = 1; // Waspada
+  } else if (outputBahaya >= 60) {
+    currentDangerState = 2; // Bahaya
+  }
+
+  // Kontrol output dan kirim data HANYA JIKA status berubah
+  if (currentDangerState != lastDangerState) {
+    kontrolOutput(currentDangerState);
+    lastDangerState = currentDangerState;
+  }
+  
+  delay(200); // Beri jeda agar tidak terlalu cepat
+}
+
+void kontrolOutput(int state) {
+  switch (state) {
+    case 0: // Aman
+      digitalWrite(LED_PIN, LOW);
+      noTone(BUZZER_PIN);
+      Serial.println("A"); // Kirim 'A' (Aman) ke ESP32
+      break;
+    case 1: // Waspada
+      digitalWrite(LED_PIN, HIGH); // LED nyala solid sebagai indikator
+      tone(BUZZER_PIN, 500, 200); // Buzzer bip pendek
+      Serial.println("W"); // Kirim 'W' (Waspada) ke ESP32
+      break;
+    case 2: // Bahaya
+      digitalWrite(LED_PIN, HIGH);
+      tone(BUZZER_PIN, 1000); // Buzzer nyala terus
+      Serial.println("B"); // Kirim 'B' (Bahaya) ke ESP32
+      break;
+  }
+}
+
+
+/*
+======================================================================
+BAGIAN 2: KODE UNTUK ESP32 (DIPERBARUI)
+Tugas: Menerima sinyal dari Arduino, koneksi ke WiFi, dan kirim data 
+       (termasuk varian roti) ke server.
+======================================================================
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// --- Pengaturan yang Perlu Anda Ubah ---
+const char* ssid = "NAMA_WIFI_ANDA";
+const char* password = "PASSWORD_WIFI_ANDA";
+const char* serverName = "http://alamat-website-anda.com/api/record";
+const int idOperator = 1; 
+const char* varianRoti = "Roti Tawar Spesial"; // <-- [PERUBAHAN] GANTI SESUAI VARIAN ROTI YANG DI DETEKSI
+// --- Akhir Pengaturan ---
+
+HardwareSerial SerialArduino(2); // RX2=16, TX2=17
+
+void setup() {
+  Serial.begin(115200);
+  SerialArduino.begin(9600, SERIAL_8N1, 16, 17);
+
+  WiFi.begin(ssid, password);
+  Serial.println("Menghubungkan ke WiFi...");
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nTerhubung ke WiFi!");
+  Serial.print("Alamat IP ESP32: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  if (SerialArduino.available() > 0) {
+    String receivedData = SerialArduino.readStringUntil('\n');
+    receivedData.trim(); // Hapus karakter whitespace
+
+    if (receivedData.equals("W") || receivedData.equals("B")) {
+      Serial.println("Sinyal deteksi diterima. Mengirim ke server...");
+      sendDetectionData("Logam Terdeteksi"); 
+    }
+    // Kita tidak melakukan apa-apa untuk sinyal "A" (Aman)
+  }
+}
+
+void sendDetectionData(String statusDeteksi) {
+  if(WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverName);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    
+    // [PERUBAHAN] Tambahkan varian_roti ke data yang dikirim
+    String httpRequestData = "status=" + statusDeteksi 
+                           + "&id_user_operator=" + String(idOperator) 
+                           + "&varian_roti=" + String(varianRoti);
+    
+    int httpResponseCode = http.POST(httpRequestData);
+    
+    if(httpResponseCode > 0) {
+      String payload = http.getString();
+      Serial.print("HTTP Response code: ");
+      Serial.println(httpResponseCode);
+      Serial.println(payload);
+    } else {
+      Serial.print("Error on sending POST: ");
+      Serial.println(httpResponseCode);
+    }
+      
+    http.end();
+  } else {
+    Serial.println("Koneksi WiFi terputus.");
+  }
+}
