@@ -9,7 +9,7 @@
 <body class="bg-gray-100 flex items-center justify-center h-screen">
     <div class="w-full max-w-md bg-white rounded-lg shadow-md p-8">
         <div class="text-center mb-8">
-            <h1 class="text-2xl font-bold text-gray-700">Sistem Deteksi Logam pada Roti</h1>
+            <h1 class="text-2xl font-bold text-gray-700">LOGIN SISTEM DETEKSI LOGAM</h1>
             <p class="text-gray-500">Silakan login untuk melanjutkan</p>
         </div>
         
