@@ -1,0 +1,921 @@
+<!-- 
+======================================================================
+PANDUAN PENEMPATAN FILE (DIPERBARUI)
+======================================================================
+1. Login.php              -> app/Controllers/Login.php
+2. Api.php                -> app/Controllers/Api.php
+3. Dashboard.php          -> app/Controllers/Dashboard.php (Diperbarui)
+4. VarianRoti.php         -> app/Controllers/VarianRoti.php
+5. VarianRotiModel.php    -> app/Models/VarianRotiModel.php
+6. ProductionModel.php    -> app/Models/ProductionModel.php
+7. DetectionModel.php     -> app/Models/DetectionModel.php
+8. template.php           -> app/Views/layout/template.php
+9. start_production_view.php -> app/Views/start_production_view.php
+10. dashboard_view.php    -> app/Views/dashboard_view.php
+11. summary_production_view.php -> app/Views/summary_production_view.php
+12. report_view.php       -> app/Views/report_view.php
+13. report_view_pdf.php   -> app/Views/report_view_pdf.php
+14. varian_roti_view.php  -> app/Views/varian_roti_view.php
+15. Routes.php            -> app/Config/Routes.php
+... (File lain tetap sama)
+======================================================================
+-->
+
+
+<!-- ====================================================================== -->
+<!-- FILE 1: app/Controllers/Login.php -->
+<!-- ====================================================================== -->
+<?php namespace App\Controllers;
+
+use App\Models\UserModel;
+
+class Login extends BaseController
+{
+    public function index()
+    {
+        return view('login_page');
+    }
+
+    public function process()
+    {
+        $session = session();
+        $model = new UserModel();
+        $username = $this->request->getVar('username');
+        $password = $this->request->getVar('password');
+        
+        $data = $model->where('username', $username)->first();
+        
+        if ($data) {
+            $pass = $data['password'];
+            $verify_pass = password_verify($password, $pass);
+            if ($verify_pass) {
+                $ses_data = [
+                    'user_id'       => $data['id'],
+                    'user_name'     => $data['nama_lengkap'],
+                    'user_username' => $data['username'],
+                    'user_role'     => $data['peran'],
+                    'logged_in'     => TRUE
+                ];
+                $session->set($ses_data);
+
+                if ($data['peran'] == 'admin') {
+                    return redirect()->to('/dashboard/full-report');
+                } else {
+                    return redirect()->to('/dashboard');
+                }
+
+            } else {
+                $session->setFlashdata('msg', 'Password salah');
+                return redirect()->to('/login');
+            }
+        } else {
+            $session->setFlashdata('msg', 'Username tidak ditemukan');
+            return redirect()->to('/login');
+        }
+    }
+
+    public function logout()
+    {
+        $session = session();
+        $session->destroy();
+        return redirect()->to('/login');
+    }
+}
+
+
+<!-- ====================================================================== -->
+<!-- FILE 2: app/Controllers/Api.php -->
+<!-- ====================================================================== -->
+<?php namespace App\Controllers;
+
+use App\Models\ProductionModel;
+use App\Models\DetectionModel;
+use CodeIgniter\API\ResponseTrait;
+
+class Api extends BaseController
+{
+    use ResponseTrait;
+
+    public function record()
+    {
+        $status = $this->request->getPostGet('status');
+        if (empty($status) || $status !== 'Logam Terdeteksi') {
+            return $this->fail('Data "status" tidak valid.', 400);
+        }
+
+        $prodModel = new ProductionModel();
+        
+        $activeProduction = $prodModel->where('status', 'Berjalan')->first();
+
+        if (!$activeProduction) {
+            return $this->fail('Tidak ada sesi produksi yang sedang berjalan.', 404);
+        }
+
+        $db = \Config\Database::connect();
+        $db->transStart();
+
+        $detectModel = new DetectionModel();
+        $detectModel->insert([ 'id_produksi' => $activeProduction['id'] ]);
+
+        $prodModel->update($activeProduction['id'], [
+            'jumlah_terdeteksi' => $activeProduction['jumlah_terdeteksi'] + 1
+        ]);
+
+        $db->transComplete();
+
+        if ($db->transStatus() === false) {
+            return $this->fail('Gagal menyimpan data deteksi.', 500);
+        }
+
+        return $this->respondCreated(['status' => 'sukses', 'message' => 'Deteksi berhasil dicatat.']);
+    }
+}
+
+
+<!-- ====================================================================== -->
+<!-- FILE 3: app/Controllers/Dashboard.php (DIPERBARUI) -->
+<!-- ====================================================================== -->
+<?php namespace App\Controllers;
+
+use App\Models\ProductionModel;
+use App\Models\DetectionModel;
+use App\Models\UserModel;
+use App\Models\VarianRotiModel;
+use Dompdf\Dompdf;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+class Dashboard extends BaseController
+{
+    public function index()
+    {
+        if (session()->get('user_role') == 'admin') {
+            return redirect()->to('/dashboard/full-report');
+        }
+
+        $prodModel = new ProductionModel();
+        
+        $activeProduction = $prodModel->select('produksi.*, varian_roti.nama_varian')
+                                      ->join('varian_roti', 'varian_roti.id = produksi.id_varian_roti')
+                                      ->where('status', 'Berjalan')->first();
+
+        if ($activeProduction) {
+            $data['title'] = 'Pemantauan Produksi';
+            $data['production'] = $activeProduction;
+            return view('dashboard_view', $data);
+        } else {
+            $varianRotiModel = new VarianRotiModel();
+            $data['title'] = 'Mulai Produksi Baru';
+            $data['varian_roti_list'] = $varianRotiModel->findAll();
+            return view('start_production_view', $data);
+        }
+    }
+
+    public function startProduction()
+    {
+        $prodModel = new ProductionModel();
+        
+        $data = [
+            'id_varian_roti' => $this->request->getPost('id_varian_roti'),
+            'jumlah_target' => $this->request->getPost('jumlah_target'),
+            'id_pengguna_operator' => session()->get('user_id'),
+            'status' => 'Berjalan'
+        ];
+
+        $prodModel->insert($data);
+
+        return redirect()->to('/dashboard');
+    }
+
+    public function finishProduction($id)
+    {
+        $prodModel = new ProductionModel();
+        $prodModel->update($id, [
+            'status' => 'Selesai',
+            'waktu_selesai' => date('Y-m-d H:i:s')
+        ]);
+
+        $finishedProduction = $prodModel->select('produksi.*, pengguna.nama_lengkap, varian_roti.nama_varian')
+                                        ->join('pengguna', 'pengguna.id = produksi.id_pengguna_operator')
+                                        ->join('varian_roti', 'varian_roti.id = produksi.id_varian_roti')
+                                        ->find($id);
+
+        if (!$finishedProduction) {
+            return redirect()->to('/dashboard');
+        }
+        
+        $data['title'] = 'Rekap Produksi Selesai';
+        $data['production'] = $finishedProduction;
+
+        return view('summary_production_view', $data);
+    }
+
+    public function getRealtimeData()
+    {
+        $prodModel = new ProductionModel();
+        $detectModel = new DetectionModel();
+
+        $activeProduction = $prodModel->where('status', 'Berjalan')->first();
+
+        if ($activeProduction) {
+            $detections = $detectModel->where('id_produksi', $activeProduction['id'])
+                                      ->orderBy('waktu', 'DESC')
+                                      ->findAll();
+            return $this->response->setJSON([
+                'production' => $activeProduction,
+                'detections' => $detections
+            ]);
+        }
+
+        return $this->response->setJSON(['error' => 'No active session'], 404);
+    }
+    
+    private function getFilteredData()
+    {
+        $prodModel = new ProductionModel();
+        $filterBulan = $this->request->getGet('bulan');
+        $filterOperator = $this->request->getGet('operator');
+
+        $query = $prodModel->select('produksi.*, pengguna.nama_lengkap, varian_roti.nama_varian')
+                           ->join('pengguna', 'pengguna.id = produksi.id_pengguna_operator')
+                           ->join('varian_roti', 'varian_roti.id = produksi.id_varian_roti')
+                           ->where('produksi.status', 'Selesai');
+
+        if ($filterBulan && $filterBulan !== 'semua') {
+            $query->where("DATE_FORMAT(produksi.waktu_mulai, '%Y-%m')", $filterBulan);
+        }
+
+        if (session()->get('user_role') == 'operator') {
+            $query->where('produksi.id_pengguna_operator', session()->get('user_id'));
+        } else {
+            if ($filterOperator && $filterOperator !== 'semua') {
+                $query->where('produksi.id_pengguna_operator', $filterOperator);
+            }
+        }
+
+        return $query->orderBy('produksi.waktu_mulai', 'DESC')->findAll();
+    }
+
+    public function fullReport()
+    {
+        $userModel = new UserModel();
+
+        $data['productions'] = $this->getFilteredData();
+        $data['title'] = 'Laporan Produksi';
+        $data['operators'] = $userModel->findAll();
+        $data['selectedBulan'] = $this->request->getGet('bulan');
+        $data['selectedOperator'] = $this->request->getGet('operator');
+        
+        return view('report_view', $data);
+    }
+
+    public function exportPDF()
+    {
+        $data['productions'] = $this->getFilteredData();
+        $data['title'] = 'Laporan Produksi PDF';
+
+        $html = view('report_view_pdf', $data);
+
+        $dompdf = new Dompdf();
+        $dompdf->loadHtml($html);
+        $dompdf->setPaper('A4', 'landscape');
+        $dompdf->render();
+        
+        // [PERUBAHAN] Ganti baris ini untuk menampilkan PDF di browser (preview)
+        $dompdf->stream('laporan-produksi.pdf', array("Attachment" => 0));
+    }
+
+    public function exportExcel()
+    {
+        $productions = $this->getFilteredData();
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+
+        $sheet->setCellValue('A1', 'Waktu Mulai');
+        $sheet->setCellValue('B1', 'Operator');
+        $sheet->setCellValue('C1', 'Varian Roti');
+        $sheet->setCellValue('D1', 'Target');
+        $sheet->setCellValue('E1', 'Terdeteksi');
+        $sheet->setCellValue('F1', 'Aman');
+
+        $row = 2;
+        foreach ($productions as $prod) {
+            $sheet->setCellValue('A' . $row, date('d-m-Y H:i', strtotime($prod['waktu_mulai'])));
+            $sheet->setCellValue('B' . $row, $prod['nama_lengkap']);
+            $sheet->setCellValue('C' . $row, $prod['nama_varian']);
+            $sheet->setCellValue('D' . $row, $prod['jumlah_target']);
+            $sheet->setCellValue('E' . $row, $prod['jumlah_terdeteksi']);
+            $sheet->setCellValue('F' . $row, $prod['jumlah_target'] - $prod['jumlah_terdeteksi']);
+            $row++;
+        }
+
+        $writer = new Xlsx($spreadsheet);
+        $filename = 'laporan-produksi.xlsx';
+        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        header('Content-Disposition: attachment;filename="' . $filename . '"');
+        header('Cache-Control: max-age=0');
+        $writer->save('php://output');
+    }
+}
+
+
+<!-- ====================================================================== -->
+<!-- FILE 4: app/Controllers/VarianRoti.php -->
+<!-- ====================================================================== -->
+<?php namespace App\Controllers;
+
+use App\Models\VarianRotiModel;
+
+class VarianRoti extends BaseController
+{
+    public function index()
+    {
+        if (session()->get('user_role') !== 'admin') {
+            return redirect()->to('/dashboard');
+        }
+
+        $model = new VarianRotiModel();
+        $data = [
+            'title' => 'Manajemen Varian Roti',
+            'variants' => $model->findAll()
+        ];
+        return view('varian_roti_view', $data);
+    }
+
+    public function save()
+    {
+        if (session()->get('user_role') !== 'admin') {
+            return redirect()->to('/dashboard');
+        }
+
+        $model = new VarianRotiModel();
+        $id = $this->request->getPost('id');
+        $data = [
+            'nama_varian' => $this->request->getPost('nama_varian'),
+        ];
+
+        if ($id) { // Update
+            $model->update($id, $data);
+            session()->setFlashdata('success', 'Varian roti berhasil diperbarui.');
+        } else { // Insert
+            $model->insert($data);
+            session()->setFlashdata('success', 'Varian roti baru berhasil ditambahkan.');
+        }
+
+        return redirect()->to('/varian-roti');
+    }
+
+    public function delete($id)
+    {
+        if (session()->get('user_role') !== 'admin') {
+            return redirect()->to('/dashboard');
+        }
+        
+        $model = new VarianRotiModel();
+        $model->delete($id);
+        session()->setFlashdata('success', 'Varian roti berhasil dihapus.');
+        return redirect()->to('/varian-roti');
+    }
+}
+
+
+<!-- ====================================================================== -->
+<!-- FILE 5: app/Models/VarianRotiModel.php -->
+<!-- ====================================================================== -->
+<?php namespace App\Models;
+
+use CodeIgniter\Model;
+
+class VarianRotiModel extends Model
+{
+    protected $table = 'varian_roti';
+    protected $primaryKey = 'id';
+    protected $allowedFields = ['nama_varian'];
+}
+
+
+<!-- ====================================================================== -->
+<!-- FILE 6: app/Models/ProductionModel.php -->
+<!-- ====================================================================== -->
+<?php namespace App\Models;
+
+use CodeIgniter\Model;
+
+class ProductionModel extends Model
+{
+    protected $table = 'produksi';
+    protected $primaryKey = 'id';
+    protected $allowedFields = [
+        'id_varian_roti',
+        'jumlah_target', 
+        'jumlah_terdeteksi', 
+        'id_pengguna_operator', 
+        'waktu_mulai', 
+        'waktu_selesai', 
+        'status'
+    ];
+    protected $useTimestamps = false;
+}
+
+
+<!-- ====================================================================== -->
+<!-- FILE 7: app/Models/DetectionModel.php -->
+<!-- ====================================================================== -->
+<?php namespace App\Models;
+
+use CodeIgniter\Model;
+
+class DetectionModel extends Model
+{
+    protected $table = 'deteksi';
+    protected $primaryKey = 'id';
+    protected $allowedFields = ['id_produksi', 'waktu'];
+    protected $useTimestamps = true;
+    protected $createdField  = 'waktu';
+    protected $updatedField  = '';
+}
+
+
+<!-- ====================================================================== -->
+<!-- FILE 8: app/Views/layout/template.php -->
+<!-- ====================================================================== -->
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?= esc($title) ?> - Sistem Deteksi Logam</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style> @media print { .no-print { display: none; } main { margin: 0 !important; padding: 0 !important; } } </style>
+</head>
+<body class="bg-gray-50">
+    <div class="flex h-screen bg-gray-200">
+        <div class="no-print w-64 bg-gray-800 text-white flex flex-col">
+            <div class="px-6 py-4 border-b border-gray-700">
+                <h2 class="text-xl font-semibold">Deteksi Logam</h2>
+                <span class="text-sm text-gray-400">Halo, <?= session()->get('user_name') ?></span>
+            </div>
+            <nav class="flex-1 px-4 py-4">
+                <?php if(session()->get('user_role') == 'operator'): ?>
+                    <a href="<?= site_url('dashboard') ?>" class="flex items-center px-4 py-2 rounded hover:bg-gray-700">
+                        <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+                        Dashboard Produksi
+                    </a>
+                <?php endif; ?>
+
+                <a href="<?= site_url('dashboard/full-report') ?>" class="mt-2 flex items-center px-4 py-2 rounded hover:bg-gray-700">
+                    <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V7a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                    Laporan Produksi
+                </a>
+
+                <?php if(session()->get('user_role') == 'admin'): ?>
+                <a href="<?= site_url('users') ?>" class="mt-2 flex items-center px-4 py-2 rounded hover:bg-gray-700">
+                     <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M15 21a6 6 0 00-9-5.197m0 0A5.975 5.975 0 0112 13a5.975 5.975 0 013-1.197M15 21a9 9 0 00-6-6.303"></path></svg>
+                    Manajemen Pengguna
+                </a>
+                <a href="<?= site_url('varian-roti') ?>" class="mt-2 flex items-center px-4 py-2 rounded hover:bg-gray-700">
+                     <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                    Manajemen Varian Roti
+                </a>
+                <?php endif; ?>
+
+                <a href="<?= site_url('login/logout') ?>" class="mt-auto mb-4 flex items-center px-4 py-2 rounded hover:bg-red-700 bg-red-600">
+                    <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                    Logout
+                </a>
+            </nav>
+        </div>
+        <main class="flex-1 p-6 overflow-y-auto">
+            <?= $this->renderSection('content') ?>
+        </main>
+    </div>
+</body>
+</html>
+
+
+<!-- ====================================================================== -->
+<!-- FILE 9: app/Views/start_production_view.php -->
+<!-- ====================================================================== -->
+<?= $this->extend('layout/template') ?>
+
+<?= $this->section('content') ?>
+<h1 class="text-3xl font-bold mb-6 text-gray-800"><?= esc($title) ?></h1>
+
+<div class="bg-white p-6 rounded-lg shadow-md max-w-lg mx-auto">
+    <form action="<?= site_url('dashboard/start') ?>" method="post">
+        <?= csrf_field() ?>
+        <div class="mb-4">
+            <label for="id_varian_roti" class="block text-gray-700 text-sm font-bold mb-2">Varian Roti</label>
+            <select name="id_varian_roti" id="id_varian_roti" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline" required>
+                <option value="">-- Pilih Varian --</option>
+                <?php foreach($varian_roti_list as $varian): ?>
+                    <option value="<?= $varian['id'] ?>"><?= esc($varian['nama_varian']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="mb-6">
+            <label for="jumlah_target" class="block text-gray-700 text-sm font-bold mb-2">Jumlah Produksi (Target)</label>
+            <input type="number" name="jumlah_target" id="jumlah_target" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline" required placeholder="Contoh: 500">
+        </div>
+        <div class="flex items-center justify-center">
+            <button type="submit" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline w-full">
+                Mulai Sesi Deteksi
+            </button>
+        </div>
+    </form>
+</div>
+<?= $this->endSection() ?>
+
+
+<!-- ====================================================================== -->
+<!-- FILE 10: app/Views/dashboard_view.php -->
+<!-- ====================================================================== -->
+<?= $this->extend('layout/template') ?>
+
+<?= $this->section('content') ?>
+<div class="flex justify-between items-center mb-4">
+    <h1 class="text-3xl font-bold text-gray-800"><?= esc($title) ?></h1>
+    <a href="<?= site_url('dashboard/finish/' . $production['id']) ?>" 
+       onclick="return confirm('Apakah Anda yakin ingin menyelesaikan sesi produksi ini?')"
+       class="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded">
+        Selesai Produksi
+    </a>
+</div>
+
+<!-- Info Produksi -->
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+    <div class="bg-white p-4 rounded-lg shadow">
+        <h3 class="text-sm font-medium text-gray-500">Varian Roti</h3>
+        <p class="mt-1 text-2xl font-semibold text-gray-900" id="info-varian"><?= esc($production['nama_varian']) ?></p>
+    </div>
+    <div class="bg-white p-4 rounded-lg shadow">
+        <h3 class="text-sm font-medium text-gray-500">Target Produksi</h3>
+        <p class="mt-1 text-2xl font-semibold text-gray-900" id="info-target"><?= esc($production['jumlah_target']) ?></p>
+    </div>
+    <div class="bg-white p-4 rounded-lg shadow">
+        <h3 class="text-sm font-medium text-gray-500">Logam Terdeteksi</h3>
+        <p class="mt-1 text-2xl font-semibold text-red-600" id="info-terdeteksi"><?= esc($production['jumlah_terdeteksi']) ?></p>
+    </div>
+</div>
+
+<!-- Tabel Real-time -->
+<div class="bg-white p-6 rounded-lg shadow-md">
+    <h2 class="text-xl font-semibold mb-4">Log Deteksi (Real-time)</h2>
+    <div class="overflow-x-auto">
+        <table class="min-w-full bg-white">
+            <thead class="bg-gray-800 text-white">
+                <tr>
+                    <th class="py-3 px-4 uppercase font-semibold text-sm text-left">Waktu Deteksi</th>
+                </tr>
+            </thead>
+            <tbody class="text-gray-700" id="realtime-data-body"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    function fetchData() {
+        fetch('<?= site_url('dashboard/get-realtime-data') ?>')
+            .then(response => {
+                if (!response.ok) { window.location.href = '<?= site_url('dashboard') ?>'; }
+                return response.json();
+            })
+            .then(data => {
+                if (data.error) { window.location.href = '<?= site_url('dashboard') ?>'; return; }
+                document.getElementById('info-terdeteksi').textContent = data.production.jumlah_terdeteksi;
+                const tbody = document.getElementById('realtime-data-body');
+                tbody.innerHTML = ''; 
+                data.detections.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.className = 'border-b';
+                    row.innerHTML = `<td class="py-3 px-4">${new Date(item.waktu).toLocaleString('id-ID')}</td>`;
+                    tbody.appendChild(row);
+                });
+            })
+            .catch(error => console.error('Error fetching data:', error));
+    }
+    document.addEventListener('DOMContentLoaded', fetchData);
+    setInterval(fetchData, 3000);
+</script>
+<?= $this->endSection() ?>
+
+
+<!-- ====================================================================== -->
+<!-- FILE 11: app/Views/summary_production_view.php -->
+<!-- ====================================================================== -->
+<?= $this->extend('layout/template') ?>
+
+<?= $this->section('content') ?>
+<h1 class="text-3xl font-bold mb-6 text-gray-800"><?= esc($title) ?></h1>
+
+<div class="bg-white p-6 rounded-lg shadow-md max-w-2xl mx-auto">
+    <div class="border-b pb-4 mb-4">
+        <h2 class="text-xl font-semibold text-gray-800"><?= esc($production['nama_varian']) ?></h2>
+        <p class="text-sm text-gray-500">Oleh: <?= esc($production['nama_lengkap']) ?></p>
+    </div>
+
+    <div class="grid grid-cols-2 gap-4 text-gray-700">
+        <div>
+            <p class="text-sm font-medium text-gray-500">Waktu Mulai</p>
+            <p class="font-semibold"><?= date('d M Y, H:i', strtotime($production['waktu_mulai'])) ?></p>
+        </div>
+        <div>
+            <p class="text-sm font-medium text-gray-500">Waktu Selesai</p>
+            <p class="font-semibold"><?= date('d M Y, H:i', strtotime($production['waktu_selesai'])) ?></p>
+        </div>
+        <div class="col-span-2 border-t pt-4">
+            <p class="text-sm font-medium text-gray-500">Target Produksi</p>
+            <p class="font-semibold text-2xl text-blue-600"><?= esc($production['jumlah_target']) ?> Roti</p>
+        </div>
+        <div class="border-t pt-4">
+            <p class="text-sm font-medium text-gray-500">Logam Terdeteksi</p>
+            <p class="font-semibold text-2xl text-red-600"><?= esc($production['jumlah_terdeteksi']) ?> Roti</p>
+        </div>
+        <div class="border-t pt-4">
+            <p class="text-sm font-medium text-gray-500">Produk Aman</p>
+            <?php $jumlah_aman = $production['jumlah_target'] - $production['jumlah_terdeteksi']; ?>
+            <p class="font-semibold text-2xl text-green-600"><?= $jumlah_aman ?> Roti</p>
+        </div>
+    </div>
+
+    <div class="mt-8 text-center">
+        <a href="<?= site_url('dashboard') ?>" class="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-6 rounded">
+            Kembali & Mulai Produksi Baru
+        </a>
+    </div>
+</div>
+<?= $this->endSection() ?>
+
+
+<!-- ====================================================================== -->
+<!-- FILE 12: app/Views/report_view.php (DIPERBARUI) -->
+<!-- ====================================================================== -->
+<?= $this->extend('layout/template') ?>
+
+<?= $this->section('content') ?>
+<div class="flex justify-between items-center mb-6">
+    <h1 class="text-3xl font-bold text-gray-800"><?= esc($title) ?></h1>
+    <div class="flex space-x-2">
+        <a href="<?= site_url('dashboard/export-pdf?' . http_build_query(['bulan' => $selectedBulan, 'operator' => $selectedOperator])) ?>" 
+           target="_blank" 
+           class="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded">
+            Export PDF
+        </a>
+        <a href="<?= site_url('dashboard/export-excel?' . http_build_query(['bulan' => $selectedBulan, 'operator' => $selectedOperator])) ?>" 
+           class="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded">
+            Export Excel
+        </a>
+    </div>
+</div>
+
+<!-- Form Filter -->
+<div class="bg-white p-4 rounded-lg shadow-md mb-6">
+    <h3 class="text-lg font-semibold mb-2">Filter Laporan</h3>
+    <form action="<?= site_url('dashboard/full-report') ?>" method="get" class="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+        <div>
+            <label for="bulan" class="block text-sm font-medium text-gray-700">Berdasarkan Bulan</label>
+            <select name="bulan" id="bulan" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500">
+                <option value="semua" <?= !isset($selectedBulan) || $selectedBulan == 'semua' ? 'selected' : '' ?>>Semua Bulan</option>
+                <?php
+                for ($i = 0; $i < 12; $i++) {
+                    $time = strtotime(sprintf('-%d months', $i));
+                    $value = date('Y-m', $time);
+                    $formatter = new IntlDateFormatter('id_ID', IntlDateFormatter::LONG, IntlDateFormatter::NONE, null, null, 'MMMM YYYY');
+                    $label = $formatter->format($time);
+                    $selected = (isset($selectedBulan) && $selectedBulan == $value) ? 'selected' : '';
+                    echo "<option value='{$value}' {$selected}>{$label}</option>";
+                }
+                ?>
+            </select>
+        </div>
+        
+        <?php if(session()->get('user_role') == 'admin'): ?>
+        <div>
+            <label for="operator" class="block text-sm font-medium text-gray-700">Berdasarkan Operator</label>
+            <select name="operator" id="operator" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500">
+                <option value="semua" <?= !isset($selectedOperator) || $selectedOperator == 'semua' ? 'selected' : '' ?>>Semua Operator</option>
+                <?php foreach($operators as $op): ?>
+                    <option value="<?= $op['id'] ?>" <?= (isset($selectedOperator) && $selectedOperator == $op['id']) ? 'selected' : '' ?>>
+                        <?= esc($op['nama_lengkap']) ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <?php endif; ?>
+
+        <div class="<?= session()->get('user_role') == 'admin' ? '' : 'md:col-start-3' ?>">
+            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-md shadow-sm">
+                Terapkan Filter
+            </button>
+        </div>
+    </form>
+</div>
+
+<!-- Tabel Laporan Produksi -->
+<div class="bg-white p-6 rounded-lg shadow-md">
+    <div class="overflow-x-auto">
+        <table class="min-w-full bg-white">
+            <thead class="bg-gray-800 text-white">
+                <tr>
+                    <th class="py-3 px-4">Waktu Mulai</th>
+                    <th class="py-3 px-4">Operator</th>
+                    <th class="py-3 px-4">Varian Roti</th>
+                    <th class="py-3 px-4">Target</th>
+                    <th class="py-3 px-4">Terdeteksi</th>
+                    <th class="py-3 px-4">Aman</th>
+                </tr>
+            </thead>
+            <tbody class="text-gray-700">
+                <?php if(!empty($productions)): ?>
+                    <?php foreach($productions as $prod): ?>
+                    <tr class="border-b">
+                        <td class="py-3 px-4"><?= date('d-m-Y H:i', strtotime($prod['waktu_mulai'])) ?></td>
+                        <td class="py-3 px-4"><?= esc($prod['nama_lengkap']) ?></td>
+                        <td class="py-3 px-4"><?= esc($prod['nama_varian']) ?></td>
+                        <td class="py-3 px-4 text-center"><?= esc($prod['jumlah_target']) ?></td>
+                        <td class="py-3 px-4 text-center text-red-600 font-semibold"><?= esc($prod['jumlah_terdeteksi']) ?></td>
+                        <td class="py-3 px-4 text-center text-green-600 font-semibold"><?= $prod['jumlah_target'] - $prod['jumlah_terdeteksi'] ?></td>
+                    </tr>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <tr><td colspan="6" class="text-center py-4">Tidak ada data produksi yang cocok.</td></tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+<?= $this->endSection() ?>
+
+
+<!-- ====================================================================== -->
+<!-- FILE 13: app/Views/report_view_pdf.php (BARU) -->
+<!-- ====================================================================== -->
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title><?= esc($title) ?></title>
+    <style>
+        body { font-family: sans-serif; font-size: 12px; }
+        h1 { text-align: center; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #ddd; padding: 8px; }
+        th { background-color: #f2f2f2; }
+        .text-center { text-align: center; }
+        .text-red { color: #dc3545; font-weight: bold; }
+        .text-green { color: #28a745; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Laporan Produksi</h1>
+    <table>
+        <thead>
+            <tr>
+                <th>Waktu Mulai</th>
+                <th>Operator</th>
+                <th>Varian Roti</th>
+                <th class="text-center">Target</th>
+                <th class="text-center">Terdeteksi</th>
+                <th class="text-center">Aman</th>
+            </tr>
+        </thead>
+        <tbody>
+            <?php if(!empty($productions)): ?>
+                <?php foreach($productions as $prod): ?>
+                <tr>
+                    <td><?= date('d-m-Y H:i', strtotime($prod['waktu_mulai'])) ?></td>
+                    <td><?= esc($prod['nama_lengkap']) ?></td>
+                    <td><?= esc($prod['nama_varian']) ?></td>
+                    <td class="text-center"><?= esc($prod['jumlah_target']) ?></td>
+                    <td class="text-center text-red"><?= esc($prod['jumlah_terdeteksi']) ?></td>
+                    <td class="text-center text-green"><?= $prod['jumlah_target'] - $prod['jumlah_terdeteksi'] ?></td>
+                </tr>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <tr><td colspan="6" class="text-center">Tidak ada data.</td></tr>
+            <?php endif; ?>
+        </tbody>
+    </table>
+</body>
+</html>
+
+
+<!-- ====================================================================== -->
+<!-- FILE 14: app/Views/varian_roti_view.php -->
+<!-- ====================================================================== -->
+<?= $this->extend('layout/template') ?>
+
+<?= $this->section('content') ?>
+<h1 class="text-3xl font-bold mb-6 text-gray-800"><?= esc($title) ?></h1>
+
+<?php if (session()->getFlashdata('success')): ?>
+    <div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative mb-4" role="alert">
+        <?= session()->getFlashdata('success') ?>
+    </div>
+<?php endif; ?>
+
+<div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+    <!-- Form Tambah/Edit Varian -->
+    <div class="md:col-span-1 bg-white p-6 rounded-lg shadow-md">
+        <h2 class="text-xl font-semibold mb-4" id="form-title">Tambah Varian Baru</h2>
+        <form action="<?= site_url('varian-roti/save') ?>" method="post" id="varian-form">
+            <?= csrf_field() ?>
+            <input type="hidden" name="id" id="varian-id">
+            <div class="mb-4">
+                <label for="nama_varian" class="block text-sm font-medium text-gray-700">Nama Varian Roti</label>
+                <input type="text" name="nama_varian" id="nama_varian" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm" required>
+            </div>
+            <div class="flex items-center space-x-2">
+                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Simpan</button>
+                <button type="button" id="cancel-edit" class="w-full bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded" style="display: none;">Batal</button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Tabel Daftar Varian -->
+    <div class="md:col-span-2 bg-white p-6 rounded-lg shadow-md">
+        <h2 class="text-xl font-semibold mb-4">Daftar Varian Roti</h2>
+        <div class="overflow-x-auto">
+            <table class="min-w-full bg-white">
+                <thead class="bg-gray-800 text-white">
+                    <tr>
+                        <th class="py-3 px-4">Nama Varian</th>
+                        <th class="py-3 px-4">Aksi</th>
+                    </tr>
+                </thead>
+                <tbody class="text-gray-700">
+                    <?php foreach($variants as $variant): ?>
+                    <tr class="border-b">
+                        <td class="py-3 px-4"><?= esc($variant['nama_varian']) ?></td>
+                        <td class="py-3 px-4 flex items-center space-x-2">
+                            <button class="text-blue-500 hover:text-blue-700" onclick="editVarian(<?= htmlspecialchars(json_encode($variant), ENT_QUOTES, 'UTF-8') ?>)">Edit</button>
+                            <a href="<?= site_url('varian-roti/delete/' . $variant['id']) ?>" class="text-red-500 hover:text-red-700" onclick="return confirm('Apakah Anda yakin ingin menghapus varian ini?')">Hapus</a>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+    const form = document.getElementById('varian-form');
+    const formTitle = document.getElementById('form-title');
+    const varianId = document.getElementById('varian-id');
+    const namaVarian = document.getElementById('nama_varian');
+    const cancelBtn = document.getElementById('cancel-edit');
+
+    function editVarian(variant) {
+        formTitle.innerText = 'Edit Varian Roti';
+        varianId.value = variant.id;
+        namaVarian.value = variant.nama_varian;
+        cancelBtn.style.display = 'block';
+        window.scrollTo(0, 0); // Scroll ke atas untuk melihat form
+    }
+
+    cancelBtn.addEventListener('click', () => {
+        form.reset();
+        formTitle.innerText = 'Tambah Varian Baru';
+        varianId.value = '';
+        cancelBtn.style.display = 'none';
+    });
+</script>
+<?= $this->endSection() ?>
+
+
+<!-- ====================================================================== -->
+<!-- FILE 15: app/Config/Routes.php (DIPERBARUI) -->
+<!-- ====================================================================== -->
+<?php
+
+use CodeIgniter\Router\RouteCollection;
+
+/** @var RouteCollection $routes */
+$routes->get('/', 'Login::index');
+$routes->get('generate-hash/(:any)', 'HashGenerator::index/$1');
+$routes->match(['get', 'post'], 'api/record', 'Api::record');
+$routes->get('login', 'Login::index');
+$routes->post('login/process', 'Login::process');
+$routes->get('login/logout', 'Login::logout');
+
+$routes->group('', ['filter' => 'auth'], function ($routes) {
+    $routes->get('dashboard', 'Dashboard::index');
+    $routes->post('dashboard/start', 'Dashboard::startProduction');
+    $routes->get('dashboard/finish/(:num)', 'Dashboard::finishProduction/$1');
+    $routes->get('dashboard/get-realtime-data', 'Dashboard::getRealtimeData');
+    $routes->get('dashboard/full-report', 'Dashboard::fullReport');
+    // [PERUBAHAN] Rute baru untuk export
+    $routes->get('dashboard/export-pdf', 'Dashboard::exportPDF');
+    $routes->get('dashboard/export-excel', 'Dashboard::exportExcel');
+    
+    // Rute untuk Manajemen Pengguna
+    $routes->get('users', 'UserManagement::index');
+    $routes->post('users/save', 'UserManagement::save');
+    $routes->get('users/delete/(:num)', 'UserManagement::delete/$1');
+
+    // Rute untuk Manajemen Varian Roti
+    $routes->get('varian-roti', 'VarianRoti::index');
+    $routes->post('varian-roti/save', 'VarianRoti::save');
+    $routes->get('varian-roti/delete/(:num)', 'VarianRoti::delete/$1');
+});

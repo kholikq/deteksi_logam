@@ -26,11 +26,18 @@ class Login extends BaseController
                     'user_id'       => $data['id'],
                     'user_name'     => $data['nama_lengkap'],
                     'user_username' => $data['username'],
-                    'user_role'     => $data['peran'], // Disesuaikan
+                    'user_role'     => $data['peran'],
                     'logged_in'     => TRUE
                 ];
                 $session->set($ses_data);
-                return redirect()->to('/dashboard');
+
+                // [PERUBAHAN] Arahkan admin ke laporan, operator ke dashboard produksi
+                if ($data['peran'] == 'admin') {
+                    return redirect()->to('/dashboard/full-report');
+                } else {
+                    return redirect()->to('/dashboard');
+                }
+
             } else {
                 $session->setFlashdata('msg', 'Password salah');
                 return redirect()->to('/login');

@@ -1,5 +1,6 @@
 <?php namespace App\Controllers;
 
+use App\Models\ProductionModel;
 use App\Models\DetectionModel;
 use CodeIgniter\API\ResponseTrait;
 
@@ -9,30 +10,40 @@ class Api extends BaseController
 
     public function record()
     {
-        if ($this->request->getMethod() !== 'post') {
-            return $this->fail('Metode tidak diizinkan', 405);
+        $status = $this->request->getPostGet('status');
+        if (empty($status) || $status !== 'Logam Terdeteksi') {
+            return $this->fail('Data "status" tidak valid.', 400);
         }
 
-        $status = $this->request->getPost('status');
-        $id_operator = $this->request->getPost('id_user_operator');
-        $varian_roti = $this->request->getPost('varian_roti'); // [PERUBAHAN] Ambil data varian roti
+        $prodModel = new ProductionModel();
+        
+        // Cari sesi produksi yang sedang berjalan (hanya boleh ada satu)
+        $activeProduction = $prodModel->where('status', 'Berjalan')->first();
 
-        // [PERUBAHAN] Tambahkan varian_roti ke validasi
-        if (empty($status) || empty($id_operator) || empty($varian_roti)) {
-            return $this->fail('Data tidak lengkap: status, id_user_operator, dan varian_roti diperlukan.', 400);
+        if (!$activeProduction) {
+            return $this->fail('Tidak ada sesi produksi yang sedang berjalan.', 404);
         }
 
-        $model = new DetectionModel();
-        $data = [
-            'status' => $status,
-            'id_pengguna_operator' => $id_operator,
-            'varian_roti' => $varian_roti, // [PERUBAHAN] Tambahkan ke data yang akan disimpan
-        ];
+        $db = \Config\Database::connect();
+        $db->transStart();
 
-        if ($model->insert($data)) {
-            return $this->respondCreated(['status' => 'sukses', 'message' => 'Data berhasil disimpan']);
-        } else {
-            return $this->fail('Gagal menyimpan data ke database', 500);
+        // 1. Catat waktu deteksi
+        $detectModel = new DetectionModel();
+        $detectModel->insert([
+            'id_produksi' => $activeProduction['id']
+        ]);
+
+        // 2. Tambah jumlah terdeteksi di tabel produksi
+        $prodModel->update($activeProduction['id'], [
+            'jumlah_terdeteksi' => $activeProduction['jumlah_terdeteksi'] + 1
+        ]);
+
+        $db->transComplete();
+
+        if ($db->transStatus() === false) {
+            return $this->fail('Gagal menyimpan data deteksi.', 500);
         }
+
+        return $this->respondCreated(['status' => 'sukses', 'message' => 'Deteksi berhasil dicatat.']);
     }
 }
